@@ -3,7 +3,7 @@
 
 # Run the claimer every 5 minutes
 # At minutes 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50 and 55 of every hour
-*/5 * * * * cd /app && node dist/simple-claimer.js 2>&1 | tee -a /tmp/claimer.log
+*/5 * * * * /bin/sh -o pipefail -c 'cd /app && node dist/simple-claimer.js 2>&1 | tee -a /tmp/claimer.log'
 
 # Optional: Run a test claim once per day at 00:00 UTC with dry-run
 # 0 0 * * * cd /app && node dist/simple-claimer.js --dry-run 2>&1 | tee -a /tmp/claimer-dry.log

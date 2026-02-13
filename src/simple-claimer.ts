@@ -59,11 +59,62 @@ interface Position {
   negativeRisk: boolean;
 }
 
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 class SimplePolymarketClaimer {
   private provider: ethers.JsonRpcProvider;
   private signer: ethers.Wallet;
   private safe?: Safe;
   private proxyAddress: string;
+
+  private isRateLimitError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = (error as any)?.response?.status;
+    const rpcCode = (error as any)?.error?.code ?? (error as any)?.code;
+    return (
+      status === 429 ||
+      rpcCode === 429 ||
+      rpcCode === -32090 ||
+      message.includes('Too many requests') ||
+      message.includes('rate limit') ||
+      message.includes('429') ||
+      message.includes('call rate limit exhausted')
+    );
+  }
+
+  private async withRetry<T>(
+    operationName: string,
+    fn: () => Promise<T>,
+    options: { maxRetries?: number; initialDelayMs?: number } = {}
+  ): Promise<T> {
+    const maxRetries = options.maxRetries ?? 5;
+    const initialDelayMs = options.initialDelayMs ?? 1000;
+
+    let attempt = 0;
+    let lastError: unknown;
+
+    while (attempt <= maxRetries) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        const canRetry = this.isRateLimitError(error) && attempt < maxRetries;
+        if (!canRetry) {
+          throw error;
+        }
+
+        // Exponential backoff with jitter to avoid synchronized retries.
+        const baseDelay = initialDelayMs * Math.pow(2, attempt);
+        const jitterMs = Math.floor(Math.random() * 500);
+        const delayMs = baseDelay + jitterMs;
+        console.log(`   ⚠️  ${operationName} rate-limited, retrying in ${Math.round(delayMs / 1000)}s...`);
+        await sleep(delayMs);
+        attempt += 1;
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(`${operationName} failed after retries`);
+  }
   
   constructor() {
     const rpcUrl = process.env.RPC_URL;
@@ -82,14 +133,14 @@ class SimplePolymarketClaimer {
     console.log('🔧 Initializing claimer...');
     
     // Verify network
-    const network = await this.provider.getNetwork();
+    const network = await this.withRetry('getNetwork', () => this.provider.getNetwork());
     if (network.chainId !== BigInt(currentConfig.chainId)) {
       throw new Error(`Wrong network. Expected chain ${currentConfig.chainId}, got ${network.chainId}`);
     }
     
     // Verify contract addresses exist on-chain
-    const ctfCode = await this.provider.getCode(currentConfig.ctfAddress);
-    const usdcCode = await this.provider.getCode(currentConfig.usdcAddress);
+    const ctfCode = await this.withRetry('getCode(CTF)', () => this.provider.getCode(currentConfig.ctfAddress));
+    const usdcCode = await this.withRetry('getCode(USDC)', () => this.provider.getCode(currentConfig.usdcAddress));
     
     if (ctfCode === '0x' || ctfCode.length < 10) {
       throw new Error(`CTF contract not found at ${currentConfig.ctfAddress}`);
@@ -99,7 +150,7 @@ class SimplePolymarketClaimer {
     }
     
     // Verify proxy is a contract
-    const proxyCode = await this.provider.getCode(this.proxyAddress);
+    const proxyCode = await this.withRetry('getCode(Safe)', () => this.provider.getCode(this.proxyAddress));
     if (proxyCode === '0x' || proxyCode.length < 10) {
       throw new Error(`No Safe contract found at ${this.proxyAddress}. Is this a valid Gnosis Safe proxy?`);
     }
@@ -111,7 +162,7 @@ class SimplePolymarketClaimer {
       safeAddress: this.proxyAddress,
     });
     
-    const owners = await this.safe.getOwners();
+    const owners = await this.withRetry('safe.getOwners', () => this.safe!.getOwners());
     const signerAddress = await this.signer.getAddress();
     
     if (!owners.includes(signerAddress)) {
@@ -119,7 +170,7 @@ class SimplePolymarketClaimer {
     }
     
     // Check Safe threshold
-    const threshold = await this.safe.getThreshold();
+    const threshold = await this.withRetry('safe.getThreshold', () => this.safe!.getThreshold());
     console.log(`   Safe threshold: ${threshold}/${owners.length}`);
     
     console.log(`✅ Connected to ${isTestMode ? 'Mumbai Testnet' : 'Polygon Mainnet'}`);
@@ -133,24 +184,28 @@ class SimplePolymarketClaimer {
     
     // IMPORTANT: Positions are held in the proxy wallet, not the EOA
     const url = `${currentConfig.polymarketApi}/positions`;
-    const limit = 100; // Items per page
+    const limit = 200; // Larger pages reduce API calls by ~50%
     let offset = 0;
     const allPositions: Position[] = [];
     
     try {
       // Paginate through all positions using offset-based pagination
       while (true) {
-        const response = await axios.get(url, {
-          params: {
-            user: this.proxyAddress.toLowerCase(),  // Use proxy address, not EOA!
-            limit,
-            offset,
-          },
-          headers: {
-            'User-Agent': 'Polymarket-Auto-Claimer/1.0',
-            'Accept': 'application/json',
-          },
-        });
+        const response = await this.withRetry(
+          `positions API (offset ${offset})`,
+          () => axios.get(url, {
+            params: {
+              user: this.proxyAddress.toLowerCase(),  // Use proxy address, not EOA!
+              limit,
+              offset,
+            },
+            headers: {
+              'User-Agent': 'Polymarket-Auto-Claimer/1.0',
+              'Accept': 'application/json',
+            },
+          }),
+          { maxRetries: 6, initialDelayMs: 1500 }
+        );
         
         const positions = response.data as Position[];
         console.log(`📄 Fetched ${positions.length} positions (offset: ${offset})`);
@@ -168,7 +223,7 @@ class SimplePolymarketClaimer {
         offset += limit;
         
         // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await sleep(250);
       }
       
       console.log(`📊 Total positions fetched: ${allPositions.length}`);
@@ -281,8 +336,8 @@ class SimplePolymarketClaimer {
       console.log(`\n   📝 Creating batched Safe transaction with ${transactions.length} calls...`);
 
       // Log Safe state
-      const nonce = await this.safe.getNonce();
-      const threshold = await this.safe.getThreshold();
+      const nonce = await this.withRetry('safe.getNonce', () => this.safe!.getNonce());
+      const threshold = await this.withRetry('safe.getThreshold', () => this.safe!.getThreshold());
       console.log(`      - Safe nonce: ${nonce}`);
       console.log(`      - Threshold: ${threshold}/1`);
 
@@ -291,7 +346,7 @@ class SimplePolymarketClaimer {
         transactions,
       });
 
-      const safeTxHash = await this.safe.getTransactionHash(safeTransaction);
+      const safeTxHash = await this.withRetry('safe.getTransactionHash', () => this.safe!.getTransactionHash(safeTransaction));
       console.log(`      - Safe TX Hash: ${safeTxHash}`);
       console.log(`      - Batched calls: ${transactions.length}`);
 
@@ -314,8 +369,8 @@ class SimplePolymarketClaimer {
       if (signers.length === 0) {
         console.log('      ⚠️  No signatures, adding manually...');
         try {
-          const txHash = await this.safe.getTransactionHash(safeTransaction);
-          const signature = await this.safe.signHash(txHash);
+          const txHash = await this.withRetry('safe.getTransactionHash', () => this.safe!.getTransactionHash(safeTransaction));
+          const signature = await this.withRetry('safe.signHash', () => this.safe!.signHash(txHash));
           (signedTx as any).addSignature(signature);
           console.log('      ✅ Manual signature added');
         } catch (e) {
@@ -327,12 +382,12 @@ class SimplePolymarketClaimer {
       console.log('\n   🚀 Executing batched transaction...');
       
       // Get current gas prices from network
-      const feeData = await this.provider.getFeeData();
+      const feeData = await this.withRetry('provider.getFeeData', () => this.provider.getFeeData());
       const signerAddress = await this.signer.getAddress();
       
       // Check for stuck pending transactions
-      let currentNonce = await this.provider.getTransactionCount(signerAddress, 'latest');
-      let pendingNonce = await this.provider.getTransactionCount(signerAddress, 'pending');
+      let currentNonce = await this.withRetry('provider.getTransactionCount(latest)', () => this.provider.getTransactionCount(signerAddress, 'latest'));
+      let pendingNonce = await this.withRetry('provider.getTransactionCount(pending)', () => this.provider.getTransactionCount(signerAddress, 'pending'));
       
       console.log(`      - Signer: ${signerAddress}`);
       console.log(`      - Latest nonce: ${currentNonce}, Pending nonce: ${pendingNonce}`);
@@ -357,13 +412,13 @@ class SimplePolymarketClaimer {
             gasLimit: 21000,
           });
           console.log(`      📤 Cancel TX sent: ${cancelTx.hash}`);
-          const receipt = await cancelTx.wait();
+          const receipt = await this.withRetry('cancelTx.wait', () => cancelTx.wait());
           console.log(`      ✅ Cancelled! Block: ${receipt?.blockNumber}`);
           cancelled++;
           
           // Re-fetch nonces AFTER cancel
-          currentNonce = await this.provider.getTransactionCount(signerAddress, 'latest');
-          pendingNonce = await this.provider.getTransactionCount(signerAddress, 'pending');
+          currentNonce = await this.withRetry('provider.getTransactionCount(latest)', () => this.provider.getTransactionCount(signerAddress, 'latest'));
+          pendingNonce = await this.withRetry('provider.getTransactionCount(pending)', () => this.provider.getTransactionCount(signerAddress, 'pending'));
           console.log(`      - New nonce: ${currentNonce}, Pending: ${pendingNonce}`);
         } catch (cancelError: any) {
           console.log(`      ❌ Cancel failed: ${cancelError.message}`);
@@ -464,7 +519,7 @@ class SimplePolymarketClaimer {
           if (e.message === 'Confirmation timeout') {
             console.log(`   ⚠️  Confirmation timeout - checking if TX exists...`);
             // Check if transaction actually exists
-            const txReceipt = await this.provider.getTransactionReceipt(txHash);
+            const txReceipt = await this.withRetry('provider.getTransactionReceipt', () => this.provider.getTransactionReceipt(txHash));
             if (txReceipt) {
               console.log(`   ✅ TX found on chain! Status: ${txReceipt.status}`);
               return { success: txReceipt.status === 1, txHash, claimed: txReceipt.status === 1 ? positions.length : 0, failed: txReceipt.status === 1 ? 0 : positions.length };
@@ -754,7 +809,7 @@ class SimplePolymarketClaimer {
     }
   }
   
-  async run(dryRun: boolean = false) {
+  async run(dryRun: boolean = false): Promise<{ claimed: number; failed: number; total: number }> {
     try {
       await this.initialize();
       
@@ -762,7 +817,7 @@ class SimplePolymarketClaimer {
       
       if (positions.length === 0) {
         console.log('\n✨ No positions to claim');
-        return;
+        return { claimed: 0, failed: 0, total: 0 };
       }
       
       const totalValue = positions.reduce((sum, pos) => sum + pos.size, 0);
@@ -816,6 +871,8 @@ class SimplePolymarketClaimer {
         console.log(`   ❌ Failed: ${totalFailed}`);
         console.log(`   📊 Total: ${positions.length}`);
       }
+
+      return { claimed: totalClaimed, failed: totalFailed, total: positions.length };
       
     } catch (error) {
       console.error('\n🚨 Fatal error:', error);
@@ -835,16 +892,16 @@ class SimplePolymarketClaimer {
     );
     
     // Get USDC balance in Safe
-    const balance = await usdcContract.balanceOf(this.proxyAddress);
+    const balance = await this.withRetry('usdc.balanceOf', () => usdcContract.balanceOf(this.proxyAddress));
     const formattedBalance = ethers.formatUnits(balance, 6);
     
     // Get MATIC balance in MetaMask/EOA (pays for gas)
     const signerAddress = await this.signer.getAddress();
-    const eoaMaticBalance = await this.provider.getBalance(signerAddress);
+    const eoaMaticBalance = await this.withRetry('provider.getBalance(EOA)', () => this.provider.getBalance(signerAddress));
     const formattedEoaMatic = ethers.formatEther(eoaMaticBalance);
     
     // Get MATIC balance in Safe (informational only)
-    const safeMaticBalance = await this.provider.getBalance(this.proxyAddress);
+    const safeMaticBalance = await this.withRetry('provider.getBalance(Safe)', () => this.provider.getBalance(this.proxyAddress));
     const formattedSafeMatic = ethers.formatEther(safeMaticBalance);
     
     console.log(`\n💰 Wallet Balances:`);
@@ -881,10 +938,10 @@ async function main() {
   await claimer.getBalances();
   
   // Run the claimer with dry run flag
-  await claimer.run(isDryRun);
+  const result = await claimer.run(isDryRun);
   
-  // Check balances after (skip in dry run since nothing changed)
-  if (!isDryRun) {
+  // Skip post-run balance checks when nothing was claimed to reduce RPC calls.
+  if (!isDryRun && result.claimed > 0) {
     await claimer.getBalances();
   }
   
