@@ -133,26 +133,49 @@ class SimplePolymarketClaimer {
     
     // IMPORTANT: Positions are held in the proxy wallet, not the EOA
     const url = `${currentConfig.polymarketApi}/positions`;
+    const limit = 100; // Items per page
+    let offset = 0;
+    const allPositions: Position[] = [];
     
     try {
-      const response = await axios.get(url, {
-        params: {
-          user: this.proxyAddress.toLowerCase(),  // Use proxy address, not EOA!
-          // Remove redeemable filter - it's unreliable and sometimes excludes winning positions
-          limit: 500,  // Increase limit to get all positions
-        },
-        headers: {
-          'User-Agent': 'Polymarket-Auto-Claimer/1.0',
-          'Accept': 'application/json',
-        },
-      });
+      // Paginate through all positions using offset-based pagination
+      while (true) {
+        const response = await axios.get(url, {
+          params: {
+            user: this.proxyAddress.toLowerCase(),  // Use proxy address, not EOA!
+            limit,
+            offset,
+          },
+          headers: {
+            'User-Agent': 'Polymarket-Auto-Claimer/1.0',
+            'Accept': 'application/json',
+          },
+        });
+        
+        const positions = response.data as Position[];
+        console.log(`📄 Fetched ${positions.length} positions (offset: ${offset})`);
+        
+        if (positions.length === 0) {
+          break; // No more data
+        }
+        
+        allPositions.push(...positions);
+        
+        if (positions.length < limit) {
+          break; // Last page (partial)
+        }
+        
+        offset += limit;
+        
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
       
-      const positions = response.data as Position[];
-      console.log(`📊 Total positions fetched: ${positions.length}`);
+      console.log(`📊 Total positions fetched: ${allPositions.length}`);
       
       // Filter for actually claimable positions
       // Only claim winning positions where curPrice = 1 and redeemable = true
-      const claimable = positions.filter(pos => {
+      const claimable = allPositions.filter(pos => {
         // Must be marked as redeemable
         if (!pos.redeemable) return false;
         
@@ -182,9 +205,9 @@ class SimplePolymarketClaimer {
       });
       
       // Log statistics
-      const redeemableCount = positions.filter(p => p.redeemable).length;
-      const winningCount = positions.filter(p => p.curPrice === 1).length;
-      const losingCount = positions.filter(p => p.curPrice === 0).length;
+      const redeemableCount = allPositions.filter(p => p.redeemable).length;
+      const winningCount = allPositions.filter(p => p.curPrice === 1).length;
+      const losingCount = allPositions.filter(p => p.curPrice === 0).length;
       
       console.log(`📊 Found ${redeemableCount} positions marked redeemable`);
       console.log(`📊 Found ${winningCount} winning positions (curPrice = 1)`);
@@ -212,6 +235,260 @@ class SimplePolymarketClaimer {
       conditionId,
       [indexSet],
     ]);
+  }
+
+  /**
+   * Batch claim multiple positions in a SINGLE Safe transaction.
+   * This is how Polymarket does it - all claims in one TX, one nonce, one block.
+   */
+  async batchClaimPositions(positions: Position[], dryRun: boolean = false): Promise<{ success: boolean; txHash?: string; claimed: number; failed: number }> {
+    if (!this.safe) throw new Error('Safe not initialized');
+    
+    if (positions.length === 0) {
+      return { success: true, claimed: 0, failed: 0 };
+    }
+
+    console.log(`\n🎯 ${dryRun ? '[DRY RUN] Would batch claim' : 'Batch claiming'} ${positions.length} positions in ONE transaction`);
+    
+    // Log all positions being claimed
+    let totalValue = 0;
+    for (const pos of positions) {
+      console.log(`   • ${pos.title} - ${pos.outcome} (${pos.size} shares)`);
+      totalValue += pos.size;
+    }
+    console.log(`   💰 Total value: ${totalValue.toFixed(2)} USDC`);
+
+    if (dryRun) {
+      console.log(`\n   ✅ [DRY RUN] Would redeem ${positions.length} positions`);
+      return { success: true, txHash: 'DRY_RUN', claimed: positions.length, failed: 0 };
+    }
+
+    try {
+      // Build array of transaction calls - one for each position
+      const transactions = positions.map(position => {
+        const calldata = this.buildRedemptionCalldata(
+          position.conditionId,
+          position.outcomeIndex
+        );
+        return {
+          to: currentConfig.ctfAddress,
+          value: '0',
+          data: calldata,
+          operation: 0 as const, // Call
+        };
+      });
+
+      console.log(`\n   📝 Creating batched Safe transaction with ${transactions.length} calls...`);
+
+      // Log Safe state
+      const nonce = await this.safe.getNonce();
+      const threshold = await this.safe.getThreshold();
+      console.log(`      - Safe nonce: ${nonce}`);
+      console.log(`      - Threshold: ${threshold}/1`);
+
+      // Create ONE Safe transaction with ALL redemption calls
+      const safeTransaction = await this.safe.createTransaction({
+        transactions,
+      });
+
+      const safeTxHash = await this.safe.getTransactionHash(safeTransaction);
+      console.log(`      - Safe TX Hash: ${safeTxHash}`);
+      console.log(`      - Batched calls: ${transactions.length}`);
+
+      // Sign transaction
+      console.log('\n   ✍️  Signing batched transaction...');
+      let signedTx;
+      try {
+        signedTx = await this.safe.signTransaction(
+          safeTransaction,
+          'eth_signTypedData_v4' as any
+        );
+      } catch {
+        signedTx = await this.safe.signTransaction(safeTransaction);
+      }
+
+      // Check signatures and add manually if needed
+      const signatures = (signedTx as any).signatures;
+      const signers = signatures ? Object.keys(signatures) : [];
+      
+      if (signers.length === 0) {
+        console.log('      ⚠️  No signatures, adding manually...');
+        try {
+          const txHash = await this.safe.getTransactionHash(safeTransaction);
+          const signature = await this.safe.signHash(txHash);
+          (signedTx as any).addSignature(signature);
+          console.log('      ✅ Manual signature added');
+        } catch (e) {
+          console.log('      ⚠️  Manual signing failed, proceeding anyway');
+        }
+      }
+
+      // Execute the batched transaction with explicit gas options
+      console.log('\n   🚀 Executing batched transaction...');
+      
+      // Get current gas prices from network
+      const feeData = await this.provider.getFeeData();
+      const signerAddress = await this.signer.getAddress();
+      
+      // Check for stuck pending transactions
+      let currentNonce = await this.provider.getTransactionCount(signerAddress, 'latest');
+      let pendingNonce = await this.provider.getTransactionCount(signerAddress, 'pending');
+      
+      console.log(`      - Signer: ${signerAddress}`);
+      console.log(`      - Latest nonce: ${currentNonce}, Pending nonce: ${pendingNonce}`);
+      
+      // Cancel ALL stuck pending transactions (up to 10 per run to avoid timeout)
+      const maxCancels = 10;
+      let cancelled = 0;
+      
+      while (pendingNonce > currentNonce && cancelled < maxCancels) {
+        const stuckCount = pendingNonce - currentNonce;
+        console.log(`      ⚠️  ${stuckCount} stuck pending transactions detected!`);
+        console.log(`      🔄 Cancelling stuck TX at nonce ${currentNonce}...`);
+        
+        try {
+          // Send 0 value TX to self to cancel the stuck TX
+          const cancelTx = await this.signer.sendTransaction({
+            to: signerAddress,
+            value: 0,
+            nonce: currentNonce,
+            maxFeePerGas: (feeData.maxFeePerGas || 50000000000n) * 2n, // 2x current gas
+            maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas || 25000000000n) * 2n,
+            gasLimit: 21000,
+          });
+          console.log(`      📤 Cancel TX sent: ${cancelTx.hash}`);
+          const receipt = await cancelTx.wait();
+          console.log(`      ✅ Cancelled! Block: ${receipt?.blockNumber}`);
+          cancelled++;
+          
+          // Re-fetch nonces AFTER cancel
+          currentNonce = await this.provider.getTransactionCount(signerAddress, 'latest');
+          pendingNonce = await this.provider.getTransactionCount(signerAddress, 'pending');
+          console.log(`      - New nonce: ${currentNonce}, Pending: ${pendingNonce}`);
+        } catch (cancelError: any) {
+          console.log(`      ❌ Cancel failed: ${cancelError.message}`);
+          break; // Stop trying if cancel fails
+        }
+      }
+      
+      // If there are still pending TXs, skip Safe execution
+      if (pendingNonce > currentNonce) {
+        console.log(`      ⚠️  Still ${pendingNonce - currentNonce} pending TXs - will retry next run`);
+        return { success: false, txHash: undefined, claimed: 0, failed: positions.length };
+      }
+      
+      // Use network gas prices with 50% buffer (Polygon can spike fast)
+      const maxGasPrice = 1000000000000n; // 1000 gwei max (safety cap only)
+      const networkFee = feeData.maxFeePerGas || 50000000000n;
+      const bufferedFee = (networkFee * 150n) / 100n; // 1.5x buffer
+      const actualMaxFee = bufferedFee < maxGasPrice ? bufferedFee : maxGasPrice;
+      
+      console.log(`      - Gas prices: network=${Number(networkFee) / 1e9} gwei, using=${Number(actualMaxFee) / 1e9} gwei (1.5x)`);
+      console.log(`      - Using nonce: ${currentNonce}`);
+      
+      const executionOptions = {
+        from: signerAddress,
+        gasLimit: '500000',
+        maxFeePerGas: actualMaxFee.toString(),
+        maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas || 25000000000n).toString(),
+        nonce: currentNonce, // Use latest confirmed nonce (updated after cancel)
+      };
+      
+      const executeTxResponse = await this.safe.executeTransaction(signedTx, executionOptions);
+      
+      // Debug: log full response structure
+      const response = executeTxResponse as any;
+      console.log(`      - Response type: ${typeof response}`);
+      console.log(`      - Response keys: ${Object.keys(response || {}).join(', ')}`);
+      
+      // The Safe SDK returns { hash, transactionResponse } 
+      // transactionResponse is the actual ethers TransactionResponse
+      const txResponse = response.transactionResponse;
+      console.log(`      - transactionResponse type: ${typeof txResponse}`);
+      console.log(`      - transactionResponse keys: ${Object.keys(txResponse || {}).join(', ')}`);
+      if (txResponse) {
+        console.log(`      - txResponse.hash: ${txResponse.hash}`);
+        console.log(`      - txResponse.nonce: ${txResponse.nonce}`);
+        console.log(`      - txResponse.from: ${txResponse.from}`);
+        console.log(`      - txResponse.to: ${txResponse.to}`);
+      }
+      const txHash = txResponse?.hash || response.hash;
+      
+      if (!txHash) {
+        console.log('   ❌ No transaction hash returned');
+        console.log(`      - Full response: ${JSON.stringify(response, null, 2).slice(0, 500)}`);
+        return { success: false, claimed: 0, failed: positions.length };
+      }
+
+      console.log(`   ✅ Batch TX submitted: ${txHash}`);
+      
+      // Use the transactionResponse.wait() method if available - this is more reliable
+      if (txResponse && typeof txResponse.wait === 'function') {
+        console.log(`   ⏳ Waiting for confirmation via txResponse.wait()...`);
+        try {
+          const receipt = await txResponse.wait(1); // Wait for 1 confirmation
+          if (receipt && receipt.status === 1) {
+            console.log(`   ✅ Batch confirmed! All ${positions.length} positions claimed`);
+            console.log(`   🔗 https://polygonscan.com/tx/${txHash}`);
+            return { success: true, txHash, claimed: positions.length, failed: 0 };
+          } else {
+            console.log(`   ❌ Batch transaction reverted (status: ${receipt?.status})`);
+            return { success: false, txHash, claimed: 0, failed: positions.length };
+          }
+        } catch (waitError: any) {
+          console.log(`   ⚠️  Wait error: ${waitError.message}`);
+          // Transaction might still be pending
+        }
+      } else {
+        console.log(`   ⚠️  No wait() method on response, using provider.waitForTransaction`);
+        console.log(`   ⏳ Waiting for confirmation...`);
+        
+        try {
+          const confirmationTimeout = 90000; // 90 seconds
+          const receipt = await Promise.race([
+            this.provider.waitForTransaction(txHash, 1),
+            new Promise<null>((_, reject) => 
+              setTimeout(() => reject(new Error('Confirmation timeout')), confirmationTimeout)
+            )
+          ]);
+
+          if (receipt && receipt.status === 1) {
+            console.log(`   ✅ Batch confirmed! All ${positions.length} positions claimed`);
+            console.log(`   🔗 https://polygonscan.com/tx/${txHash}`);
+            return { success: true, txHash, claimed: positions.length, failed: 0 };
+          } else if (receipt && receipt.status === 0) {
+            console.log(`   ❌ Batch transaction reverted on-chain`);
+            return { success: false, txHash, claimed: 0, failed: positions.length };
+          }
+        } catch (e: any) {
+          if (e.message === 'Confirmation timeout') {
+            console.log(`   ⚠️  Confirmation timeout - checking if TX exists...`);
+            // Check if transaction actually exists
+            const txReceipt = await this.provider.getTransactionReceipt(txHash);
+            if (txReceipt) {
+              console.log(`   ✅ TX found on chain! Status: ${txReceipt.status}`);
+              return { success: txReceipt.status === 1, txHash, claimed: txReceipt.status === 1 ? positions.length : 0, failed: txReceipt.status === 1 ? 0 : positions.length };
+            } else {
+              console.log(`   ❌ TX not found on chain - broadcast may have failed`);
+              return { success: false, claimed: 0, failed: positions.length };
+            }
+          }
+          console.log(`   ⚠️  Confirmation error: ${e.message}`);
+        }
+      }
+
+      return { success: false, claimed: 0, failed: positions.length };
+
+    } catch (error: any) {
+      console.log(`\n   ❌ Batch claim failed: ${error.message}`);
+      
+      // If batch fails, suggest retry
+      if (positions.length > 1) {
+        console.log(`   ℹ️  Try with smaller batch size on next run`);
+      }
+      
+      return { success: false, claimed: 0, failed: positions.length };
+    }
   }
   
   async claimPosition(position: Position, dryRun: boolean = false) {
@@ -333,38 +610,95 @@ class SimplePolymarketClaimer {
         console.log(`      ✅ Signatures present from: ${signers.join(', ')}`);
       }
       
-      // Execute transaction
+      // Execute transaction with explicit gas options
       console.log('\n   🚀 Executing transaction...');
       try {
-        const executeTxResponse = await this.safe.executeTransaction(signedTx);
+        // Get current gas prices from network
+        const feeData = await this.provider.getFeeData();
+        const signerAddress = await this.signer.getAddress();
+        const latestNonce = await this.provider.getTransactionCount(signerAddress, 'latest');
+        
+        // Use network gas prices with 50% buffer (Polygon can spike fast)
+        const maxGasPrice = 1000000000000n; // 1000 gwei max (safety cap only)
+        const networkFee = feeData.maxFeePerGas || 50000000000n;
+        const bufferedFee = (networkFee * 150n) / 100n; // 1.5x buffer
+        const actualMaxFee = bufferedFee < maxGasPrice ? bufferedFee : maxGasPrice;
+        
+        console.log(`      - Signer: ${signerAddress}, nonce: ${latestNonce}`);
+        console.log(`      - Gas: network=${Number(networkFee) / 1e9} gwei, using=${Number(actualMaxFee) / 1e9} gwei (1.5x)`);
+        
+        const executionOptions = {
+          from: signerAddress,
+          gasLimit: '300000',
+          maxFeePerGas: actualMaxFee.toString(),
+          maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas || 25000000000n).toString(),
+          nonce: latestNonce,
+        };
+        
+        const executeTxResponse = await this.safe.executeTransaction(signedTx, executionOptions);
         
         // Log full response for debugging
         console.log('   📦 Execution response received');
+        console.log(`      - Response keys: ${Object.keys(executeTxResponse as any).join(', ')}`);
         
         // In Safe SDK v4, the response structure is different
-        // Check if we have a hash directly in the response
-        const txHash = (executeTxResponse as any).hash || 
-                      (executeTxResponse as any).transactionHash ||
-                      (executeTxResponse as any).safeTxHash;
+        // The actual on-chain transaction hash should be in 'hash' or from the transactionResponse
+        const response = executeTxResponse as any;
+        
+        // Try to get the actual blockchain transaction hash
+        let txHash: string | null = null;
+        
+        if (response.hash) {
+          txHash = response.hash;
+          console.log(`      - Found hash: ${txHash}`);
+        }
+        if (response.transactionResponse?.hash) {
+          txHash = response.transactionResponse.hash;
+          console.log(`      - Found transactionResponse.hash: ${txHash}`);
+        }
+        if (!txHash && response.safeTxHash) {
+          console.log(`      ⚠️  Only safeTxHash found (not a blockchain tx): ${response.safeTxHash}`);
+        }
         
         if (txHash) {
-          console.log(`   ✅ Claimed! TX: ${txHash}`);
+          console.log(`   ✅ TX submitted: ${txHash}`);
           
-          // Try to wait for confirmation if possible
+          // MUST wait for confirmation before proceeding to next claim
+          // Otherwise all claims use the same nonce and only one can succeed
           try {
-            const receipt = await this.provider.waitForTransaction(txHash, 1);
+            const confirmationTimeout = 90000; // 90 seconds - Polygon can be slow
+            console.log(`   ⏳ Waiting for confirmation (up to 90s)...`);
+            const receipt = await Promise.race([
+              this.provider.waitForTransaction(txHash, 1),
+              new Promise<null>((_, reject) => 
+                setTimeout(() => reject(new Error('Confirmation timeout')), confirmationTimeout)
+              )
+            ]);
             if (receipt) {
-              console.log(`   ✅ Confirmed on chain`);
+              console.log(`   ✅ Confirmed on chain (status: ${receipt.status})`);
+              if (receipt.status === 0) {
+                console.log(`   ❌ Transaction reverted on-chain!`);
+                return { success: false, error: 'Transaction reverted' };
+              }
+              return { success: true, txHash };
             }
-          } catch {
-            // Transaction might be relayed, so we can't always wait for it
-            console.log(`   ⚠️  Transaction submitted via relayer`);
+          } catch (e: any) {
+            if (e.message === 'Confirmation timeout') {
+              console.log(`   ⚠️  Confirmation timeout - stopping to avoid nonce issues`);
+              console.log(`   ℹ️  TX may still confirm later. Check: https://polygonscan.com/tx/${txHash}`);
+              // Return failure to stop processing more claims with potentially stale nonce
+              return { success: false, error: 'Confirmation timeout - nonce may be stale' };
+            } else {
+              console.log(`   ⚠️  Could not verify transaction: ${e.message}`);
+              return { success: false, error: `Verification failed: ${e.message}` };
+            }
           }
           
           return { success: true, txHash };
         } else {
-          console.log('   ⚠️  Transaction submitted (may be relayed)');
-          return { success: true, txHash: null };
+          console.log('   ❌ No blockchain transaction hash returned!');
+          console.log(`      - Full response: ${JSON.stringify(response, null, 2).slice(0, 500)}`);
+          return { success: false, error: 'No transaction hash returned' };
         }
       } catch (execError: any) {
         console.log('\n   ❌ Execution failed');
@@ -431,46 +765,55 @@ class SimplePolymarketClaimer {
         return;
       }
       
+      const totalValue = positions.reduce((sum, pos) => sum + pos.size, 0);
+      
       if (dryRun) {
         console.log(`\n🔍 DRY RUN MODE - Found ${positions.length} claimable positions:`);
         console.log('=' .repeat(60));
-        
-        let totalValue = 0;
-        for (const position of positions) {
-          totalValue += position.size;
-        }
-        
         console.log(`\n📊 Total claimable value: ${totalValue.toFixed(2)} USDC`);
       } else {
-        console.log(`\n🚀 Starting to claim ${positions.length} positions...`);
+        console.log(`\n🚀 Batch claiming ${positions.length} positions (${totalValue.toFixed(2)} USDC)...`);
       }
       
-      let successCount = 0;
-      let failCount = 0;
+      // Batch claims into groups of 10 (like Polymarket does)
+      const BATCH_SIZE = 10;
+      let totalClaimed = 0;
+      let totalFailed = 0;
       
-      for (const position of positions) {
-        const result = await this.claimPosition(position, dryRun);
+      // Process all positions in batches
+      for (let i = 0; i < positions.length; i += BATCH_SIZE) {
+        const batch = positions.slice(i, i + BATCH_SIZE);
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+        const totalBatches = Math.ceil(positions.length / BATCH_SIZE);
         
-        if (result.success) {
-          successCount++;
-        } else {
-          failCount++;
+        if (totalBatches > 1) {
+          console.log(`\n📦 Processing batch ${batchNum}/${totalBatches} (${batch.length} positions)`);
         }
         
-        // Small delay between claims (skip in dry run)
-        if (!dryRun) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
+        const result = await this.batchClaimPositions(batch, dryRun);
+        totalClaimed += result.claimed;
+        totalFailed += result.failed;
+        
+        // If batch failed, stop processing more batches
+        if (!result.success && !dryRun) {
+          console.log(`\n   ⚠️  Batch failed - stopping. Will retry remaining in next run.`);
+          break;
+        }
+        
+        // Small delay between batches (if more than one)
+        if (!dryRun && i + BATCH_SIZE < positions.length) {
+          console.log('   ⏳ Waiting 3s before next batch...');
+          await new Promise(resolve => setTimeout(resolve, 3000));
         }
       }
       
       console.log('\n📈 Summary:');
       if (dryRun) {
-        console.log(`   🔍 [DRY RUN] Would claim: ${successCount} positions`);
-        const totalValue = positions.reduce((sum, pos) => sum + pos.size, 0);
+        console.log(`   🔍 [DRY RUN] Would claim: ${positions.length} positions`);
         console.log(`   💰 Total value: ${totalValue.toFixed(2)} USDC`);
       } else {
-        console.log(`   ✅ Successful: ${successCount}`);
-        console.log(`   ❌ Failed: ${failCount}`);
+        console.log(`   ✅ Claimed: ${totalClaimed}`);
+        console.log(`   ❌ Failed: ${totalFailed}`);
         console.log(`   📊 Total: ${positions.length}`);
       }
       
@@ -515,6 +858,15 @@ class SimplePolymarketClaimer {
 
 // Main execution
 async function main() {
+  // Set a hard timeout of 2 minutes to prevent hanging
+  const PROCESS_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+  const timeoutId = setTimeout(() => {
+    console.error('⏰ Process timeout reached (2 minutes) - forcing exit');
+    process.exit(1);
+  }, PROCESS_TIMEOUT_MS);
+  // Don't let the timeout keep the process alive if we finish early
+  timeoutId.unref();
+  
   console.log('🎯 Polymarket Auto-Claimer');
   
   if (isDryRun) {
@@ -535,6 +887,10 @@ async function main() {
   if (!isDryRun) {
     await claimer.getBalances();
   }
+  
+  // Explicitly exit to ensure process terminates (closes RPC connections, etc.)
+  console.log('✅ Done - exiting');
+  process.exit(0);
 }
 
 // Handle direct execution
